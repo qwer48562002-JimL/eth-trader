@@ -1,33 +1,31 @@
 """
-ETH 多空雙向模擬交易機器人
-使用 MAX 交易所公開 API 取得 K 線資料
-指標：Stoch RSI、MACD、BB 線
-紀錄儲存：PostgreSQL（Railway 提供）
+ETH 多空雙向模擬交易機器人 v3
+- 多空各自最多 4 筆持倉
+- 每筆進場使用當前該方向資金的 1/4
+- 紀錄儲存於 PostgreSQL
 """
 
 import requests
 import pandas as pd
 import numpy as np
-import os
-import time
+import os, time, json
 from datetime import datetime
 
-# ── PostgreSQL ───────────────────────────────────────────────────────────────
 try:
     import psycopg2
-    import psycopg2.extras
     HAS_PG = True
 except ImportError:
     HAS_PG = False
 
-# ── 設定區 ──────────────────────────────────────────────────────────────────
+# ── 設定區 ───────────────────────────────────────────────────────────────────
 
 CONFIG = {
     "initial_capital_long":  1000,
     "initial_capital_short": 1000,
-    "trade_ratio": 1.0,
-    "symbol": "ethtwd",
-    "quote_currency": "TWD",
+    "trade_ratio":   0.25,       # 每次進場使用該方向資金的 1/4
+    "max_positions": 4,          # 同方向最多持倉數
+    "symbol":        "ethtwd",
+    "quote_currency":"TWD",
     "main_period":     "30m",
     "trend_period_4h": "4h",
     "trend_period_1d": "1d",
@@ -47,26 +45,22 @@ CONFIG = {
 
 MAX_API_BASE = "https://max-api.maicoin.com/api/v2"
 
-# ── 資料庫連線 ───────────────────────────────────────────────────────────────
+# ── 資料庫 ───────────────────────────────────────────────────────────────────
 
 def get_db_conn():
-    """從環境變數 DATABASE_URL 取得連線"""
     db_url = os.environ.get("DATABASE_URL")
     if not db_url or not HAS_PG:
         return None
     try:
-        conn = psycopg2.connect(db_url, sslmode="require")
-        return conn
+        return psycopg2.connect(db_url, sslmode="require")
     except Exception as e:
         print(f"[DB] 連線失敗：{e}")
         return None
 
-
 def init_db():
-    """建立資料表（若不存在）"""
     conn = get_db_conn()
     if not conn:
-        print("[DB] 無法連線，將使用本機檔案儲存")
+        print("[DB] 無法連線，使用本機檔案儲存")
         return
     try:
         with conn.cursor() as cur:
@@ -87,8 +81,14 @@ def init_db():
                     pnl_pct FLOAT NOT NULL,
                     reason TEXT NOT NULL,
                     signals TEXT,
+                    position_id TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
+            """)
+            # 補欄位（舊資料庫相容）
+            cur.execute("""
+                ALTER TABLE trade_log
+                ADD COLUMN IF NOT EXISTS position_id TEXT;
             """)
         conn.commit()
         print("[DB] 資料表初始化完成")
@@ -97,10 +97,20 @@ def init_db():
     finally:
         conn.close()
 
+def _serialize(obj):
+    if isinstance(obj, (bool, np.bool_)):
+        return bool(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: _serialize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_serialize(i) for i in obj]
+    return obj
 
-def db_get(key: str, default=None):
-    """從資料庫讀取狀態"""
-    import json
+def db_get(key, default=None):
     conn = get_db_conn()
     if not conn:
         return default
@@ -115,27 +125,12 @@ def db_get(key: str, default=None):
     finally:
         conn.close()
 
-
-def db_set(key: str, value):
-    """寫入狀態到資料庫"""
-    import json
-
-    def serialize(obj):
-        if isinstance(obj, bool):
-            return bool(obj)
-        if isinstance(obj, (int, float, str, type(None))):
-            return obj
-        if isinstance(obj, dict):
-            return {k: serialize(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return [serialize(i) for i in obj]
-        return str(obj)
-
+def db_set(key, value):
     conn = get_db_conn()
     if not conn:
         return
     try:
-        serialized = json.dumps(serialize(value))
+        serialized = json.dumps(_serialize(value))
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO state (key, value, updated_at)
@@ -149,38 +144,20 @@ def db_set(key: str, value):
     finally:
         conn.close()
 
-
-def db_log_trade(side: str, action: str, price: float, pnl: float,
-                 reason: str, signals: dict):
-    """記錄交易到資料庫"""
-    import json
-
-    def serialize(obj):
-        if isinstance(obj, bool):
-            return bool(obj)
-        if isinstance(obj, (int, float, str, type(None))):
-            return obj
-        if isinstance(obj, dict):
-            return {k: serialize(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return [serialize(i) for i in obj]
-        return str(obj)
-
+def db_log_trade(side, action, price, pnl, reason, signals, position_id=""):
     conn = get_db_conn()
     if not conn:
         return
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO trade_log (time, side, action, price, pnl_pct, reason, signals)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO trade_log
+                (time, side, action, price, pnl_pct, reason, signals, position_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                datetime.now(),
-                side, action,
-                float(price),
-                round(float(pnl) * 100, 2),
-                reason,
-                json.dumps(serialize(signals))
+                datetime.now(), side, action,
+                float(price), round(float(pnl) * 100, 2),
+                reason, json.dumps(_serialize(signals)), position_id
             ))
         conn.commit()
     except Exception as e:
@@ -190,12 +167,13 @@ def db_log_trade(side: str, action: str, price: float, pnl: float,
 
 # ── MAX API ──────────────────────────────────────────────────────────────────
 
-def fetch_klines(symbol: str, period: str, limit: int = 200) -> pd.DataFrame:
+def fetch_klines(symbol, period, limit=200):
     period_map = {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440}
-    minutes = period_map.get(period, 30)
     try:
         resp = requests.get(f"{MAX_API_BASE}/k",
-                            params={"market": symbol, "period": minutes, "limit": limit},
+                            params={"market": symbol,
+                                    "period": period_map.get(period, 30),
+                                    "limit": limit},
                             timeout=10)
         resp.raise_for_status()
         df = pd.DataFrame(resp.json(),
@@ -204,179 +182,146 @@ def fetch_klines(symbol: str, period: str, limit: int = 200) -> pd.DataFrame:
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
         return df.sort_values("timestamp").reset_index(drop=True)
     except Exception as e:
-        print(f"[ERROR] 取得 K 線失敗 ({symbol} {period}): {e}")
+        print(f"[ERROR] K 線失敗 ({symbol} {period}): {e}")
         return pd.DataFrame()
 
 # ── 技術指標 ─────────────────────────────────────────────────────────────────
 
 def calc_rsi(series, period=14):
     delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=period-1, min_periods=period).mean()
-    avg_loss = loss.ewm(com=period-1, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    gain  = delta.clip(lower=0)
+    loss  = -delta.clip(upper=0)
+    avg_g = gain.ewm(com=period-1, min_periods=period).mean()
+    avg_l = loss.ewm(com=period-1, min_periods=period).mean()
+    rs    = avg_g / avg_l.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-def calc_stoch_rsi(close, period=14, smooth_k=3, smooth_d=3):
+def calc_stoch_rsi(close, period=14, sk=3, sd=3):
     rsi = calc_rsi(close, period)
-    rsi_min = rsi.rolling(period).min()
-    rsi_max = rsi.rolling(period).max()
-    stoch = (rsi - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan) * 100
-    k = stoch.rolling(smooth_k).mean()
-    return k, k.rolling(smooth_d).mean()
+    mn  = rsi.rolling(period).min()
+    mx  = rsi.rolling(period).max()
+    k   = ((rsi - mn) / (mx - mn).replace(0, np.nan) * 100).rolling(sk).mean()
+    return k, k.rolling(sd).mean()
 
 def calc_macd(close, fast=12, slow=26, signal=9):
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line, macd_line - signal_line
+    ml = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+    sl = ml.ewm(span=signal, adjust=False).mean()
+    return ml, sl, ml - sl
 
-def calc_bb(close, period=20, std_mult=2.0):
-    middle = close.rolling(period).mean()
+def calc_bb(close, period=20, mult=2.0):
+    mid = close.rolling(period).mean()
     std = close.rolling(period).std()
-    return middle + std_mult*std, middle, middle - std_mult*std
+    return mid + mult*std, mid, mid - mult*std
 
 def add_indicators(df):
-    cfg = CONFIG
-    k, d = calc_stoch_rsi(df["close"], cfg["stoch_rsi_period"],
-                           cfg["stoch_rsi_smooth_k"], cfg["stoch_rsi_smooth_d"])
-    df["stoch_k"] = k
-    df["stoch_d"] = d
-    macd, sig, hist = calc_macd(df["close"], cfg["macd_fast"],
-                                 cfg["macd_slow"], cfg["macd_signal"])
-    df["macd"] = macd
-    df["macd_signal"] = sig
-    df["macd_hist"] = hist
-    upper, mid, lower = calc_bb(df["close"], cfg["bb_period"], cfg["bb_std"])
-    df["bb_upper"] = upper
-    df["bb_middle"] = mid
-    df["bb_lower"] = lower
+    c = CONFIG
+    df["stoch_k"], df["stoch_d"] = calc_stoch_rsi(
+        df["close"], c["stoch_rsi_period"], c["stoch_rsi_smooth_k"], c["stoch_rsi_smooth_d"])
+    df["macd"], df["macd_signal"], df["macd_hist"] = calc_macd(
+        df["close"], c["macd_fast"], c["macd_slow"], c["macd_signal"])
+    df["bb_upper"], df["bb_middle"], df["bb_lower"] = calc_bb(
+        df["close"], c["bb_period"], c["bb_std"])
     return df
 
-# ── 趨勢判斷 ─────────────────────────────────────────────────────────────────
+# ── 趨勢 ─────────────────────────────────────────────────────────────────────
 
 def check_trend(df_4h, df_1d):
     if df_4h.empty or df_1d.empty:
         return "neutral"
     df_4h = add_indicators(df_4h)
     df_1d = add_indicators(df_1d)
-    m4  = float(df_4h["macd"].iloc[-1])
-    h4  = float(df_4h["macd_hist"].iloc[-1])
-    m1d = float(df_1d["macd"].iloc[-1])
-    if m4 > 0 and h4 > 0 and m1d > 0:
-        return "bull"
-    if m4 < 0 and h4 < 0 and m1d < 0:
-        return "bear"
+    m4, h4 = float(df_4h["macd"].iloc[-1]), float(df_4h["macd_hist"].iloc[-1])
+    m1d    = float(df_1d["macd"].iloc[-1])
+    if m4 > 0 and h4 > 0 and m1d > 0: return "bull"
+    if m4 < 0 and h4 < 0 and m1d < 0: return "bear"
     return "neutral"
 
 # ── 進場訊號 ─────────────────────────────────────────────────────────────────
 
 def check_long_signals(df):
-    row  = df.iloc[-1]
-    prev = df.iloc[-2]
-    s_stoch = bool(prev["stoch_k"] < 20 and
-                   row["stoch_k"] > row["stoch_d"] and
-                   prev["stoch_k"] <= prev["stoch_d"])
-    s_macd  = bool(row["macd"] > row["macd_signal"] and
-                   prev["macd"] <= prev["macd_signal"] and
-                   row["macd_hist"] > 0)
-    s_bb    = bool(prev["close"] <= prev["bb_lower"] * 1.005 and
-                   row["close"] > row["bb_lower"] and
-                   row["close"] > prev["close"])
-    count = sum([s_stoch, s_macd, s_bb])
-    return {"stoch_rsi": s_stoch, "macd": s_macd, "bb": s_bb,
-            "count": count, "entry": bool(count >= 2)}
+    r, p = df.iloc[-1], df.iloc[-2]
+    s1 = bool(p["stoch_k"] < 20 and r["stoch_k"] > r["stoch_d"] and p["stoch_k"] <= p["stoch_d"])
+    s2 = bool(r["macd"] > r["macd_signal"] and p["macd"] <= p["macd_signal"] and r["macd_hist"] > 0)
+    s3 = bool(p["close"] <= p["bb_lower"]*1.005 and r["close"] > r["bb_lower"] and r["close"] > p["close"])
+    cnt = sum([s1, s2, s3])
+    return {"stoch_rsi": s1, "macd": s2, "bb": s3, "count": cnt, "entry": bool(cnt >= 2)}
 
 def check_short_signals(df):
-    row  = df.iloc[-1]
-    prev = df.iloc[-2]
-    s_stoch = bool(prev["stoch_k"] > 80 and
-                   row["stoch_k"] < row["stoch_d"] and
-                   prev["stoch_k"] >= prev["stoch_d"])
-    s_macd  = bool(row["macd"] < row["macd_signal"] and
-                   prev["macd"] >= prev["macd_signal"] and
-                   row["macd_hist"] < 0)
-    s_bb    = bool(prev["close"] >= prev["bb_upper"] * 0.995 and
-                   row["close"] < row["bb_upper"] and
-                   row["close"] < prev["close"])
-    count = sum([s_stoch, s_macd, s_bb])
-    return {"stoch_rsi": s_stoch, "macd": s_macd, "bb": s_bb,
-            "count": count, "entry": bool(count >= 2)}
+    r, p = df.iloc[-1], df.iloc[-2]
+    s1 = bool(p["stoch_k"] > 80 and r["stoch_k"] < r["stoch_d"] and p["stoch_k"] >= p["stoch_d"])
+    s2 = bool(r["macd"] < r["macd_signal"] and p["macd"] >= p["macd_signal"] and r["macd_hist"] < 0)
+    s3 = bool(p["close"] >= p["bb_upper"]*0.995 and r["close"] < r["bb_upper"] and r["close"] < p["close"])
+    cnt = sum([s1, s2, s3])
+    return {"stoch_rsi": s1, "macd": s2, "bb": s3, "count": cnt, "entry": bool(cnt >= 2)}
 
 # ── 出場訊號 ─────────────────────────────────────────────────────────────────
 
-def check_long_exit_signals(df):
-    row  = df.iloc[-1]
-    prev = df.iloc[-2]
-    weak = {
-        "stoch_rsi": bool(prev["stoch_k"] > 80 and row["stoch_k"] < row["stoch_d"]),
-        "macd":      bool((row["macd"] < row["macd_signal"] and prev["macd"] >= prev["macd_signal"]) or
-                          (row["macd_hist"] < 0 and prev["macd_hist"] >= 0)),
-        "bb":        bool(prev["close"] >= prev["bb_upper"] * 0.995 and row["close"] < row["bb_middle"]),
+def check_long_exit(df):
+    r, p = df.iloc[-1], df.iloc[-2]
+    w = {
+        "stoch_rsi": bool(p["stoch_k"] > 80 and r["stoch_k"] < r["stoch_d"]),
+        "macd":      bool((r["macd"] < r["macd_signal"] and p["macd"] >= p["macd_signal"]) or
+                          (r["macd_hist"] < 0 and p["macd_hist"] >= 0)),
+        "bb":        bool(p["close"] >= p["bb_upper"]*0.995 and r["close"] < r["bb_middle"]),
     }
-    weak["any"] = bool(any([weak["stoch_rsi"], weak["macd"], weak["bb"]]))
-    return weak
+    w["any"] = bool(any([w["stoch_rsi"], w["macd"], w["bb"]]))
+    return w
 
-def check_short_exit_signals(df):
-    row  = df.iloc[-1]
-    prev = df.iloc[-2]
-    weak = {
-        "stoch_rsi": bool(prev["stoch_k"] < 20 and row["stoch_k"] > row["stoch_d"]),
-        "macd":      bool((row["macd"] > row["macd_signal"] and prev["macd"] <= prev["macd_signal"]) or
-                          (row["macd_hist"] > 0 and prev["macd_hist"] <= 0)),
-        "bb":        bool(prev["close"] <= prev["bb_lower"] * 1.005 and row["close"] > row["bb_middle"]),
+def check_short_exit(df):
+    r, p = df.iloc[-1], df.iloc[-2]
+    w = {
+        "stoch_rsi": bool(p["stoch_k"] < 20 and r["stoch_k"] > r["stoch_d"]),
+        "macd":      bool((r["macd"] > r["macd_signal"] and p["macd"] <= p["macd_signal"]) or
+                          (r["macd_hist"] > 0 and p["macd_hist"] <= 0)),
+        "bb":        bool(p["close"] <= p["bb_lower"]*1.005 and r["close"] > r["bb_middle"]),
     }
-    weak["any"] = bool(any([weak["stoch_rsi"], weak["macd"], weak["bb"]]))
-    return weak
+    w["any"] = bool(any([w["stoch_rsi"], w["macd"], w["bb"]]))
+    return w
 
 # ── 持倉類別 ─────────────────────────────────────────────────────────────────
 
 class Position:
-    def __init__(self, side, entry_price, capital, entry_time, signals):
-        self.side          = side
-        self.entry_price   = float(entry_price)
-        self.capital       = float(capital)
-        self.entry_time    = entry_time
-        self.entry_signals = signals
-        self.quantity      = float(capital) / float(entry_price)
+    def __init__(self, side, entry_price, capital, entry_time, signals, pos_id=None):
+        self.side            = side
+        self.entry_price     = float(entry_price)
+        self.capital         = float(capital)
+        self.entry_time      = entry_time
+        self.entry_signals   = signals
+        self.quantity        = float(capital) / float(entry_price)
         self.trailing_active = False
-        self.extreme_price = float(entry_price)
+        self.extreme_price   = float(entry_price)
+        self.pos_id          = pos_id or datetime.now().strftime("%Y%m%d%H%M%S%f")
 
     def update_extreme(self, price):
         price = float(price)
         if self.side == "long":
-            if price > self.extreme_price:
-                self.extreme_price = price
+            if price > self.extreme_price: self.extreme_price = price
         else:
-            if price < self.extreme_price:
-                self.extreme_price = price
+            if price < self.extreme_price: self.extreme_price = price
 
-    def current_pnl_pct(self, price):
+    def pnl_pct(self, price):
         price = float(price)
         if self.side == "long":
             return (price - self.entry_price) / self.entry_price
         return (self.entry_price - price) / self.entry_price
 
     def should_stop_loss(self, price):
-        return self.current_pnl_pct(price) <= -CONFIG["stop_loss_pct"]
+        return self.pnl_pct(price) <= -CONFIG["stop_loss_pct"]
 
     def check_trailing(self, price):
         price = float(price)
-        pnl = self.current_pnl_pct(price)
+        pnl   = self.pnl_pct(price)
         if pnl >= CONFIG["trail_start_pct"]:
             self.trailing_active = True
         if self.trailing_active:
-            if self.side == "long":
-                retrace = (self.extreme_price - price) / self.extreme_price
-            else:
-                retrace = (price - self.extreme_price) / self.extreme_price
+            retrace = ((self.extreme_price - price) / self.extreme_price if self.side == "long"
+                       else (price - self.extreme_price) / self.extreme_price)
             return retrace >= CONFIG["trail_drop_pct"]
         return False
 
     def to_dict(self):
         return {
+            "pos_id":          self.pos_id,
             "side":            self.side,
             "entry_price":     self.entry_price,
             "capital":         self.capital,
@@ -384,22 +329,20 @@ class Position:
             "entry_time":      self.entry_time.isoformat(),
             "extreme_price":   self.extreme_price,
             "trailing_active": bool(self.trailing_active),
-            "entry_signals":   {k: bool(v) if isinstance(v, (bool, np.bool_)) else v
-                                for k, v in self.entry_signals.items()},
+            "entry_signals":   _serialize(self.entry_signals),
         }
 
     @classmethod
     def from_dict(cls, d):
         p = cls(d["side"], d["entry_price"], d["capital"],
-                datetime.fromisoformat(d["entry_time"]), d.get("entry_signals", {}))
+                datetime.fromisoformat(d["entry_time"]),
+                d.get("entry_signals", {}), d.get("pos_id"))
         p.quantity        = d["quantity"]
         p.extreme_price   = d["extreme_price"]
         p.trailing_active = d["trailing_active"]
         return p
 
-# ── 狀態管理（DB 優先，fallback 本機 JSON）────────────────────────────────────
-
-import json
+# ── 狀態管理 ─────────────────────────────────────────────────────────────────
 
 def load_state():
     data = db_get("bot_state")
@@ -409,10 +352,10 @@ def load_state():
         with open("state.json") as f:
             return json.load(f)
     return {
-        "capital_long":   CONFIG["initial_capital_long"],
-        "capital_short":  CONFIG["initial_capital_short"],
-        "position_long":  None,
-        "position_short": None,
+        "capital_long":    CONFIG["initial_capital_long"],
+        "capital_short":   CONFIG["initial_capital_short"],
+        "positions_long":  [],
+        "positions_short": [],
         "total_trades": 0, "win_trades": 0, "total_pnl": 0.0,
         "long_trades":  0, "long_wins":  0, "long_pnl":  0.0,
         "short_trades": 0, "short_wins": 0, "short_pnl": 0.0,
@@ -421,72 +364,91 @@ def load_state():
 def save_state(state):
     db_set("bot_state", state)
     with open("state.json", "w") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-def log_trade(side, action, price, pnl, reason, signals):
-    db_log_trade(side, action, price, pnl, reason, signals)
+        json.dump(_serialize(state), f, ensure_ascii=False, indent=2)
 
 # ── 顯示狀態 ─────────────────────────────────────────────────────────────────
 
-def print_status(state, price, trend, pos_long, pos_short):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def print_status(state, price, trend, longs, shorts):
+    now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total = state["total_trades"]
-    wr = state["win_trades"] / total * 100 if total > 0 else 0
-    print(f"\n{'='*60}")
+    wr    = state["win_trades"] / total * 100 if total > 0 else 0
+    print(f"\n{'='*62}")
     print(f"  ETH 多空模擬交易  |  {now}")
-    print(f"{'='*60}")
-    print(f"  當前價格   : {price:,.0f} {CONFIG['quote_currency']}")
-    print(f"  大趨勢方向 : {'🟢 多頭' if trend=='bull' else '🔴 空頭' if trend=='bear' else '⚪ 中性'}")
-    print(f"  累計交易   : {total} 筆  勝率 {wr:.1f}%  損益 {state['total_pnl']:+.2f} USDT")
-    print(f"\n  【做多】資金 {state['capital_long']:,.2f}  {state['long_trades']}筆  {state['long_pnl']:+.2f} USDT")
-    if pos_long:
-        pnl = pos_long.current_pnl_pct(price) * 100
-        print(f"    ▶ 持倉  進場 {pos_long.entry_price:,.0f}  損益 {pnl:+.2f}%  "
-              f"極值 {pos_long.extreme_price:,.0f}  滾動 {'✅' if pos_long.trailing_active else '⏳'}")
-    else:
-        print(f"    ▶ 空倉，等待多頭訊號")
-    print(f"\n  【做空】資金 {state['capital_short']:,.2f}  {state['short_trades']}筆  {state['short_pnl']:+.2f} USDT")
-    if pos_short:
-        pnl = pos_short.current_pnl_pct(price) * 100
-        print(f"    ▶ 持倉  進場 {pos_short.entry_price:,.0f}  損益 {pnl:+.2f}%  "
-              f"極值 {pos_short.extreme_price:,.0f}  滾動 {'✅' if pos_short.trailing_active else '⏳'}")
-    else:
-        print(f"    ▶ 空倉，等待空頭訊號")
-    print(f"{'='*60}")
+    print(f"{'='*62}")
+    print(f"  價格 {price:,.0f} {CONFIG['quote_currency']}  |  "
+          f"趨勢 {'🟢多頭' if trend=='bull' else '🔴空頭' if trend=='bear' else '⚪中性'}  |  "
+          f"累計 {total}筆 勝率{wr:.1f}% 損益{state['total_pnl']:+.2f}")
+
+    # 多單
+    print(f"\n  【做多】可用資金 {state['capital_long']:,.2f} USDT  "
+          f"持倉 {len(longs)}/{CONFIG['max_positions']}  "
+          f"累計損益 {state['long_pnl']:+.2f} USDT")
+    for i, pos in enumerate(longs, 1):
+        pnl = pos.pnl_pct(price) * 100
+        print(f"    #{i} 進場 {pos.entry_price:,.0f}  "
+              f"資金 {pos.capital:,.0f}  "
+              f"損益 {pnl:+.2f}%  "
+              f"滾動{'✅' if pos.trailing_active else '⏳'}")
+    if not longs:
+        print(f"    空倉，等待多頭訊號")
+
+    # 空單
+    print(f"\n  【做空】可用資金 {state['capital_short']:,.2f} USDT  "
+          f"持倉 {len(shorts)}/{CONFIG['max_positions']}  "
+          f"累計損益 {state['short_pnl']:+.2f} USDT")
+    for i, pos in enumerate(shorts, 1):
+        pnl = pos.pnl_pct(price) * 100
+        print(f"    #{i} 進場 {pos.entry_price:,.0f}  "
+              f"資金 {pos.capital:,.0f}  "
+              f"損益 {pnl:+.2f}%  "
+              f"滾動{'✅' if pos.trailing_active else '⏳'}")
+    if not shorts:
+        print(f"    空倉，等待空頭訊號")
+    print(f"{'='*62}")
 
 # ── 出場處理 ─────────────────────────────────────────────────────────────────
 
-def process_exit(state, pos, price, exit_reason):
-    pnl      = pos.current_pnl_pct(price)
+def process_exit(state, pos, price, reason):
+    pnl      = pos.pnl_pct(price)
     pnl_usdt = pnl * pos.capital
     sk       = pos.side
-    state[f"capital_{sk}"]  += pos.capital + pnl_usdt
-    state[f"{sk}_trades"]   += 1
-    state[f"{sk}_pnl"]      += pnl_usdt
-    state["total_trades"]   += 1
-    state["total_pnl"]      += pnl_usdt
+    state[f"capital_{sk}"] += pos.capital + pnl_usdt
+    state[f"{sk}_trades"]  += 1
+    state[f"{sk}_pnl"]     += pnl_usdt
+    state["total_trades"]  += 1
+    state["total_pnl"]     += pnl_usdt
     if pnl > 0:
-        state["win_trades"]     += 1
-        state[f"{sk}_wins"]     += 1
-    icon  = "📤" if sk == "long" else "📥"
+        state["win_trades"]    += 1
+        state[f"{sk}_wins"]    += 1
     label = "多單" if sk == "long" else "空單"
-    print(f"\n  {icon} {label}出場！{exit_reason}")
-    print(f"     {pos.entry_price:,.0f} → {price:,.0f}  {pnl*100:+.2f}% ({pnl_usdt:+.2f} USDT)")
-    log_trade(sk, "EXIT", price, pnl, exit_reason, {})
+    icon  = "📤" if sk == "long" else "📥"
+    print(f"\n  {icon} {label}出場 #{pos.pos_id[-6:]}  {reason}")
+    print(f"     {pos.entry_price:,.0f}→{price:,.0f}  {pnl*100:+.2f}% ({pnl_usdt:+.2f} USDT)")
+    db_log_trade(sk, "EXIT", price, pnl, reason, {}, pos.pos_id)
 
 # ── 主循環 ───────────────────────────────────────────────────────────────────
 
 def run():
-    print("🚀 ETH 多空雙向模擬交易機器人啟動")
+    print("🚀 ETH 多空雙向模擬交易機器人 v3 啟動")
+    print(f"   每次進場資金：該方向可用資金的 {CONFIG['trade_ratio']*100:.0f}%  |  "
+          f"同方向最多 {CONFIG['max_positions']} 筆")
     init_db()
 
-    state     = load_state()
-    pos_long  = Position.from_dict(state["position_long"])  if state.get("position_long")  else None
-    pos_short = Position.from_dict(state["position_short"]) if state.get("position_short") else None
+    state  = load_state()
+
+    # 相容舊版（單一持倉 → 陣列）
+    if "position_long" in state and "positions_long" not in state:
+        old_l = state.pop("position_long", None)
+        old_s = state.pop("position_short", None)
+        state["positions_long"]  = [old_l] if old_l else []
+        state["positions_short"] = [old_s] if old_s else []
+
+    longs  = [Position.from_dict(d) for d in state.get("positions_long",  [])]
+    shorts = [Position.from_dict(d) for d in state.get("positions_short", [])]
 
     while True:
         try:
-            df_30m = fetch_klines(CONFIG["symbol"], CONFIG["main_period"], limit=100)
+            df_30m = fetch_klines(CONFIG["symbol"], CONFIG["main_period"],     limit=100)
             df_4h  = fetch_klines(CONFIG["symbol"], CONFIG["trend_period_4h"], limit=100)
             df_1d  = fetch_klines(CONFIG["symbol"], CONFIG["trend_period_1d"], limit=100)
 
@@ -498,76 +460,88 @@ def run():
             price  = float(df_30m["close"].iloc[-1])
             df_30m = add_indicators(df_30m)
             trend  = check_trend(df_4h, df_1d)
-            print_status(state, price, trend, pos_long, pos_short)
+            print_status(state, price, trend, longs, shorts)
 
-            # ── 多單管理 ──
-            if pos_long:
-                pos_long.update_extreme(price)
-                exit_reason = None
-                if pos_long.should_stop_loss(price):
-                    exit_reason = "停損"
+            # ── 多單管理 ──────────────────────────────────────────────────────
+            weak_long = check_long_exit(df_30m)
+            exited = []
+            for pos in longs:
+                pos.update_extreme(price)
+                reason = None
+                if pos.should_stop_loss(price):
+                    reason = "停損"
                 else:
-                    weak = check_long_exit_signals(df_30m)
-                    if pos_long.trailing_active and weak["any"]:
-                        names = [k for k, v in weak.items() if v and k != "any"]
-                        exit_reason = f"指標轉弱（{'、'.join(names)}）"
-                    elif pos_long.check_trailing(price):
-                        exit_reason = "滾動停利觸發"
-                if exit_reason:
-                    process_exit(state, pos_long, price, exit_reason)
-                    pos_long = None
-                    state["position_long"] = None
-            else:
-                if trend in ("bull", "neutral"):
-                    sig = check_long_signals(df_30m)
-                    triggered = [k for k, v in sig.items() if v is True]
-                    print(f"  多頭訊號：{', '.join(triggered) if triggered else '無'} ({sig['count']}/3)")
-                    if sig["entry"]:
-                        cap = state["capital_long"] * CONFIG["trade_ratio"]
-                        pos_long = Position("long", price, cap, datetime.now(), sig)
+                    if pos.trailing_active and weak_long["any"]:
+                        names  = [k for k, v in weak_long.items() if v and k != "any"]
+                        reason = f"指標轉弱（{'、'.join(names)}）"
+                    elif pos.check_trailing(price):
+                        reason = "滾動停利觸發"
+                if reason:
+                    process_exit(state, pos, price, reason)
+                    exited.append(pos)
+            longs = [p for p in longs if p not in exited]
+
+            if len(longs) < CONFIG["max_positions"] and trend in ("bull", "neutral"):
+                sig = check_long_signals(df_30m)
+                triggered = [k for k, v in sig.items() if v is True]
+                print(f"  多頭訊號：{', '.join(triggered) if triggered else '無'} ({sig['count']}/3)")
+                if sig["entry"]:
+                    cap = state["capital_long"] * CONFIG["trade_ratio"]
+                    if cap > 0:
+                        pos = Position("long", price, cap, datetime.now(), sig)
+                        longs.append(pos)
                         state["capital_long"] -= cap
-                        state["position_long"] = pos_long.to_dict()
-                        log_trade("long", "ENTRY", price, 0, f"訊號：{', '.join(triggered)}", sig)
-                        print(f"\n  📈 多單進場！{price:,.0f}  訊號：{', '.join(triggered)}")
-                else:
-                    print(f"  空頭趨勢，多單暫停")
-
-            # ── 空單管理 ──
-            if pos_short:
-                pos_short.update_extreme(price)
-                exit_reason = None
-                if pos_short.should_stop_loss(price):
-                    exit_reason = "停損"
-                else:
-                    weak = check_short_exit_signals(df_30m)
-                    if pos_short.trailing_active and weak["any"]:
-                        names = [k for k, v in weak.items() if v and k != "any"]
-                        exit_reason = f"指標轉強（{'、'.join(names)}）"
-                    elif pos_short.check_trailing(price):
-                        exit_reason = "滾動停利觸發"
-                if exit_reason:
-                    process_exit(state, pos_short, price, exit_reason)
-                    pos_short = None
-                    state["position_short"] = None
+                        db_log_trade("long", "ENTRY", price, 0,
+                                     f"訊號：{', '.join(triggered)}", sig, pos.pos_id)
+                        print(f"\n  📈 多單進場 #{pos.pos_id[-6:]}  "
+                              f"資金 {cap:,.0f}  訊號：{', '.join(triggered)}")
             else:
-                if trend in ("bear", "neutral"):
-                    sig = check_short_signals(df_30m)
-                    triggered = [k for k, v in sig.items() if v is True]
-                    print(f"  空頭訊號：{', '.join(triggered) if triggered else '無'} ({sig['count']}/3)")
-                    if sig["entry"]:
-                        cap = state["capital_short"] * CONFIG["trade_ratio"]
-                        pos_short = Position("short", price, cap, datetime.now(), sig)
-                        state["capital_short"] -= cap
-                        state["position_short"] = pos_short.to_dict()
-                        log_trade("short", "ENTRY", price, 0, f"訊號：{', '.join(triggered)}", sig)
-                        print(f"\n  📉 空單進場！{price:,.0f}  訊號：{', '.join(triggered)}")
-                else:
-                    print(f"  多頭趨勢，空單暫停")
+                if trend == "bear":
+                    print(f"  空頭趨勢，多單暫停")
+                elif len(longs) >= CONFIG["max_positions"]:
+                    print(f"  多單已滿 {CONFIG['max_positions']} 筆，等待出場")
 
-            if pos_long:
-                state["position_long"]  = pos_long.to_dict()
-            if pos_short:
-                state["position_short"] = pos_short.to_dict()
+            # ── 空單管理 ──────────────────────────────────────────────────────
+            weak_short = check_short_exit(df_30m)
+            exited = []
+            for pos in shorts:
+                pos.update_extreme(price)
+                reason = None
+                if pos.should_stop_loss(price):
+                    reason = "停損"
+                else:
+                    if pos.trailing_active and weak_short["any"]:
+                        names  = [k for k, v in weak_short.items() if v and k != "any"]
+                        reason = f"指標轉強（{'、'.join(names)}）"
+                    elif pos.check_trailing(price):
+                        reason = "滾動停利觸發"
+                if reason:
+                    process_exit(state, pos, price, reason)
+                    exited.append(pos)
+            shorts = [p for p in shorts if p not in exited]
+
+            if len(shorts) < CONFIG["max_positions"] and trend in ("bear", "neutral"):
+                sig = check_short_signals(df_30m)
+                triggered = [k for k, v in sig.items() if v is True]
+                print(f"  空頭訊號：{', '.join(triggered) if triggered else '無'} ({sig['count']}/3)")
+                if sig["entry"]:
+                    cap = state["capital_short"] * CONFIG["trade_ratio"]
+                    if cap > 0:
+                        pos = Position("short", price, cap, datetime.now(), sig)
+                        shorts.append(pos)
+                        state["capital_short"] -= cap
+                        db_log_trade("short", "ENTRY", price, 0,
+                                     f"訊號：{', '.join(triggered)}", sig, pos.pos_id)
+                        print(f"\n  📉 空單進場 #{pos.pos_id[-6:]}  "
+                              f"資金 {cap:,.0f}  訊號：{', '.join(triggered)}")
+            else:
+                if trend == "bull":
+                    print(f"  多頭趨勢，空單暫停")
+                elif len(shorts) >= CONFIG["max_positions"]:
+                    print(f"  空單已滿 {CONFIG['max_positions']} 筆，等待出場")
+
+            state["positions_long"]  = [p.to_dict() for p in longs]
+            state["positions_short"] = [p.to_dict() for p in shorts]
             save_state(state)
 
         except KeyboardInterrupt:
