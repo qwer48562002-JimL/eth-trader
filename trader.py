@@ -1,7 +1,9 @@
 """
-ETH 多空雙向模擬交易機器人 v3
-- 多空各自最多 4 筆持倉
-- 每筆進場使用當前該方向資金的 1/4
+ETH 多空雙向模擬交易機器人 v4
+- 單次趨勢只進場一次（MACD 交叉或 BB 觸軌反轉視為一次趨勢）
+- 訊號反轉後重置，才能偵測下一次趨勢
+- 成交量確認：反轉當根量 > 前20根均量 1.2 倍
+- 多空各自最多 4 筆，每筆使用該方向資金 1/4
 - 紀錄儲存於 PostgreSQL
 """
 
@@ -22,8 +24,8 @@ except ImportError:
 CONFIG = {
     "initial_capital_long":  1000,
     "initial_capital_short": 1000,
-    "trade_ratio":   0.25,       # 每次進場使用該方向資金的 1/4
-    "max_positions": 4,          # 同方向最多持倉數
+    "trade_ratio":   0.25,
+    "max_positions": 4,
     "symbol":        "ethtwd",
     "quote_currency":"TWD",
     "main_period":     "30m",
@@ -40,6 +42,8 @@ CONFIG = {
     "macd_signal":  9,
     "bb_period":   20,
     "bb_std":       2.0,
+    "vol_ma_period":   20,   # 成交量均線週期
+    "vol_multiplier":  1.2,  # 成交量需大於均量的倍數
     "check_interval_sec": 60,
 }
 
@@ -85,11 +89,7 @@ def init_db():
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """)
-            # 補欄位（舊資料庫相容）
-            cur.execute("""
-                ALTER TABLE trade_log
-                ADD COLUMN IF NOT EXISTS position_id TEXT;
-            """)
+            cur.execute("ALTER TABLE trade_log ADD COLUMN IF NOT EXISTS position_id TEXT;")
         conn.commit()
         print("[DB] 資料表初始化完成")
     except Exception as e:
@@ -98,22 +98,16 @@ def init_db():
         conn.close()
 
 def _serialize(obj):
-    if isinstance(obj, (bool, np.bool_)):
-        return bool(obj)
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, dict):
-        return {k: _serialize(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_serialize(i) for i in obj]
+    if isinstance(obj, (bool, np.bool_)):   return bool(obj)
+    if isinstance(obj, np.integer):          return int(obj)
+    if isinstance(obj, np.floating):         return float(obj)
+    if isinstance(obj, dict):                return {k: _serialize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):       return [_serialize(i) for i in obj]
     return obj
 
 def db_get(key, default=None):
     conn = get_db_conn()
-    if not conn:
-        return default
+    if not conn: return default
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT value FROM state WHERE key = %s", (key,))
@@ -127,17 +121,13 @@ def db_get(key, default=None):
 
 def db_set(key, value):
     conn = get_db_conn()
-    if not conn:
-        return
+    if not conn: return
     try:
-        serialized = json.dumps(_serialize(value))
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO state (key, value, updated_at)
-                VALUES (%s, %s, NOW())
-                ON CONFLICT (key) DO UPDATE
-                SET value = EXCLUDED.value, updated_at = NOW()
-            """, (key, serialized))
+                INSERT INTO state (key, value, updated_at) VALUES (%s, %s, NOW())
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+            """, (key, json.dumps(_serialize(value))))
         conn.commit()
     except Exception as e:
         print(f"[DB] 寫入失敗 {key}：{e}")
@@ -146,19 +136,15 @@ def db_set(key, value):
 
 def db_log_trade(side, action, price, pnl, reason, signals, position_id=""):
     conn = get_db_conn()
-    if not conn:
-        return
+    if not conn: return
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO trade_log
-                (time, side, action, price, pnl_pct, reason, signals, position_id)
+                INSERT INTO trade_log (time, side, action, price, pnl_pct, reason, signals, position_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                datetime.now(), side, action,
-                float(price), round(float(pnl) * 100, 2),
-                reason, json.dumps(_serialize(signals)), position_id
-            ))
+            """, (datetime.now(), side, action, float(price),
+                  round(float(pnl) * 100, 2), reason,
+                  json.dumps(_serialize(signals)), position_id))
         conn.commit()
     except Exception as e:
         print(f"[DB] 寫入交易紀錄失敗：{e}")
@@ -189,18 +175,14 @@ def fetch_klines(symbol, period, limit=200):
 
 def calc_rsi(series, period=14):
     delta = series.diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
-    avg_g = gain.ewm(com=period-1, min_periods=period).mean()
-    avg_l = loss.ewm(com=period-1, min_periods=period).mean()
-    rs    = avg_g / avg_l.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    avg_g = delta.clip(lower=0).ewm(com=period-1, min_periods=period).mean()
+    avg_l = (-delta.clip(upper=0)).ewm(com=period-1, min_periods=period).mean()
+    return 100 - (100 / (1 + avg_g / avg_l.replace(0, np.nan)))
 
 def calc_stoch_rsi(close, period=14, sk=3, sd=3):
     rsi = calc_rsi(close, period)
-    mn  = rsi.rolling(period).min()
-    mx  = rsi.rolling(period).max()
-    k   = ((rsi - mn) / (mx - mn).replace(0, np.nan) * 100).rolling(sk).mean()
+    mn, mx = rsi.rolling(period).min(), rsi.rolling(period).max()
+    k = ((rsi - mn) / (mx - mn).replace(0, np.nan) * 100).rolling(sk).mean()
     return k, k.rolling(sd).mean()
 
 def calc_macd(close, fast=12, slow=26, signal=9):
@@ -221,13 +203,13 @@ def add_indicators(df):
         df["close"], c["macd_fast"], c["macd_slow"], c["macd_signal"])
     df["bb_upper"], df["bb_middle"], df["bb_lower"] = calc_bb(
         df["close"], c["bb_period"], c["bb_std"])
+    df["vol_ma"] = df["volume"].rolling(c["vol_ma_period"]).mean()
     return df
 
-# ── 趨勢 ─────────────────────────────────────────────────────────────────────
+# ── 趨勢判斷 ─────────────────────────────────────────────────────────────────
 
 def check_trend(df_4h, df_1d):
-    if df_4h.empty or df_1d.empty:
-        return "neutral"
+    if df_4h.empty or df_1d.empty: return "neutral"
     df_4h = add_indicators(df_4h)
     df_1d = add_indicators(df_1d)
     m4, h4 = float(df_4h["macd"].iloc[-1]), float(df_4h["macd_hist"].iloc[-1])
@@ -236,23 +218,117 @@ def check_trend(df_4h, df_1d):
     if m4 < 0 and h4 < 0 and m1d < 0: return "bear"
     return "neutral"
 
-# ── 進場訊號 ─────────────────────────────────────────────────────────────────
+# ── 成交量確認 ────────────────────────────────────────────────────────────────
 
-def check_long_signals(df):
-    r, p = df.iloc[-1], df.iloc[-2]
-    s1 = bool(p["stoch_k"] < 20 and r["stoch_k"] > r["stoch_d"] and p["stoch_k"] <= p["stoch_d"])
-    s2 = bool(r["macd"] > r["macd_signal"] and p["macd"] <= p["macd_signal"] and r["macd_hist"] > 0)
-    s3 = bool(p["close"] <= p["bb_lower"]*1.005 and r["close"] > r["bb_lower"] and r["close"] > p["close"])
-    cnt = sum([s1, s2, s3])
-    return {"stoch_rsi": s1, "macd": s2, "bb": s3, "count": cnt, "entry": bool(cnt >= 2)}
+def volume_confirmed(df) -> bool:
+    """當根收盤量 > 前N根均量 × 倍數"""
+    row = df.iloc[-1]
+    if pd.isna(row["vol_ma"]) or row["vol_ma"] == 0:
+        return True  # 均量尚未建立，不過濾
+    confirmed = bool(row["volume"] > row["vol_ma"] * CONFIG["vol_multiplier"])
+    return confirmed
 
-def check_short_signals(df):
+# ── 趨勢訊號狀態機 ────────────────────────────────────────────────────────────
+#
+# 每個訊號（MACD 金叉/死叉、BB 觸下軌/上軌）都有自己的狀態：
+#   "idle"     : 等待訊號出現
+#   "fired"    : 訊號已觸發並進場，等待反向訊號重置
+#
+# 重置條件：
+#   MACD 多頭（金叉）→ 死叉出現後重置
+#   MACD 空頭（死叉）→ 金叉出現後重置
+#   BB 多頭（觸下軌）→ 價格回到中線以上後重置
+#   BB 空頭（觸上軌）→ 價格回到中線以下後重置
+#
+# 任兩個訊號同時 fire → 進場（加上成交量確認）
+
+def update_signal_states(df, states: dict) -> dict:
+    """
+    更新所有訊號狀態，回傳新狀態與本次可用的進場訊號
+    states 格式：
+    {
+        "macd_long":  "idle" | "fired",
+        "macd_short": "idle" | "fired",
+        "bb_long":    "idle" | "fired",
+        "bb_short":   "idle" | "fired",
+        "stoch_long": "idle" | "fired",
+        "stoch_short":"idle" | "fired",
+    }
+    """
     r, p = df.iloc[-1], df.iloc[-2]
-    s1 = bool(p["stoch_k"] > 80 and r["stoch_k"] < r["stoch_d"] and p["stoch_k"] >= p["stoch_d"])
-    s2 = bool(r["macd"] < r["macd_signal"] and p["macd"] >= p["macd_signal"] and r["macd_hist"] < 0)
-    s3 = bool(p["close"] >= p["bb_upper"]*0.995 and r["close"] < r["bb_upper"] and r["close"] < p["close"])
-    cnt = sum([s1, s2, s3])
-    return {"stoch_rsi": s1, "macd": s2, "bb": s3, "count": cnt, "entry": bool(cnt >= 2)}
+    new_states  = dict(states)
+    fire_long   = {}   # 本根 K 棒新觸發的多頭訊號
+    fire_short  = {}   # 本根 K 棒新觸發的空頭訊號
+
+    # ── MACD ────────────────────────────────────────────────
+    macd_golden = bool(r["macd"] > r["macd_signal"] and p["macd"] <= p["macd_signal"])  # 金叉
+    macd_dead   = bool(r["macd"] < r["macd_signal"] and p["macd"] >= p["macd_signal"])  # 死叉
+
+    # 多頭：金叉觸發；死叉出現後重置
+    if new_states["macd_long"] == "fired" and macd_dead:
+        new_states["macd_long"] = "idle"
+        print("  🔄 MACD 多頭訊號重置（死叉）")
+    if new_states["macd_long"] == "idle" and macd_golden:
+        new_states["macd_long"] = "fired"
+        fire_long["macd"] = True
+
+    # 空頭：死叉觸發；金叉出現後重置
+    if new_states["macd_short"] == "fired" and macd_golden:
+        new_states["macd_short"] = "idle"
+        print("  🔄 MACD 空頭訊號重置（金叉）")
+    if new_states["macd_short"] == "idle" and macd_dead:
+        new_states["macd_short"] = "fired"
+        fire_short["macd"] = True
+
+    # ── BB 線 ────────────────────────────────────────────────
+    bb_touch_lower = bool(p["close"] <= p["bb_lower"] * 1.005 and
+                          r["close"] > r["bb_lower"] and r["close"] > p["close"])
+    bb_touch_upper = bool(p["close"] >= p["bb_upper"] * 0.995 and
+                          r["close"] < r["bb_upper"] and r["close"] < p["close"])
+    price_above_mid = bool(r["close"] > r["bb_middle"])
+    price_below_mid = bool(r["close"] < r["bb_middle"])
+
+    # 多頭：觸下軌反彈觸發；價格回到中線以上後重置
+    if new_states["bb_long"] == "fired" and price_above_mid:
+        new_states["bb_long"] = "idle"
+        print("  🔄 BB 多頭訊號重置（價格回中線以上）")
+    if new_states["bb_long"] == "idle" and bb_touch_lower:
+        new_states["bb_long"] = "fired"
+        fire_long["bb"] = True
+
+    # 空頭：觸上軌反轉觸發；價格跌回中線以下後重置
+    if new_states["bb_short"] == "fired" and price_below_mid:
+        new_states["bb_short"] = "idle"
+        print("  🔄 BB 空頭訊號重置（價格跌回中線以下）")
+    if new_states["bb_short"] == "idle" and bb_touch_upper:
+        new_states["bb_short"] = "fired"
+        fire_short["bb"] = True
+
+    # ── Stoch RSI ────────────────────────────────────────────
+    stoch_golden = bool(p["stoch_k"] < 20 and r["stoch_k"] > r["stoch_d"] and
+                        p["stoch_k"] <= p["stoch_d"])
+    stoch_dead   = bool(p["stoch_k"] > 80 and r["stoch_k"] < r["stoch_d"] and
+                        p["stoch_k"] >= p["stoch_d"])
+    stoch_mid_up   = bool(r["stoch_k"] > 50)
+    stoch_mid_down = bool(r["stoch_k"] < 50)
+
+    # 多頭：從超賣區上穿觸發；Stoch K 回到 50 以下後重置
+    if new_states["stoch_long"] == "fired" and stoch_mid_down:
+        new_states["stoch_long"] = "idle"
+        print("  🔄 Stoch RSI 多頭訊號重置（K 線跌回 50 以下）")
+    if new_states["stoch_long"] == "idle" and stoch_golden:
+        new_states["stoch_long"] = "fired"
+        fire_long["stoch_rsi"] = True
+
+    # 空頭：從超買區下穿觸發；Stoch K 回到 50 以上後重置
+    if new_states["stoch_short"] == "fired" and stoch_mid_up:
+        new_states["stoch_short"] = "idle"
+        print("  🔄 Stoch RSI 空頭訊號重置（K 線升回 50 以上）")
+    if new_states["stoch_short"] == "idle" and stoch_dead:
+        new_states["stoch_short"] = "fired"
+        fire_short["stoch_rsi"] = True
+
+    return new_states, fire_long, fire_short
 
 # ── 出場訊號 ─────────────────────────────────────────────────────────────────
 
@@ -301,17 +377,15 @@ class Position:
 
     def pnl_pct(self, price):
         price = float(price)
-        if self.side == "long":
-            return (price - self.entry_price) / self.entry_price
-        return (self.entry_price - price) / self.entry_price
+        return ((price - self.entry_price) / self.entry_price if self.side == "long"
+                else (self.entry_price - price) / self.entry_price)
 
     def should_stop_loss(self, price):
         return self.pnl_pct(price) <= -CONFIG["stop_loss_pct"]
 
     def check_trailing(self, price):
         price = float(price)
-        pnl   = self.pnl_pct(price)
-        if pnl >= CONFIG["trail_start_pct"]:
+        if self.pnl_pct(price) >= CONFIG["trail_start_pct"]:
             self.trailing_active = True
         if self.trailing_active:
             retrace = ((self.extreme_price - price) / self.extreme_price if self.side == "long"
@@ -321,15 +395,12 @@ class Position:
 
     def to_dict(self):
         return {
-            "pos_id":          self.pos_id,
-            "side":            self.side,
-            "entry_price":     self.entry_price,
-            "capital":         self.capital,
-            "quantity":        self.quantity,
-            "entry_time":      self.entry_time.isoformat(),
-            "extreme_price":   self.extreme_price,
+            "pos_id": self.pos_id, "side": self.side,
+            "entry_price": self.entry_price, "capital": self.capital,
+            "quantity": self.quantity, "entry_time": self.entry_time.isoformat(),
+            "extreme_price": self.extreme_price,
             "trailing_active": bool(self.trailing_active),
-            "entry_signals":   _serialize(self.entry_signals),
+            "entry_signals": _serialize(self.entry_signals),
         }
 
     @classmethod
@@ -344,21 +415,33 @@ class Position:
 
 # ── 狀態管理 ─────────────────────────────────────────────────────────────────
 
+DEFAULT_SIGNAL_STATES = {
+    "macd_long": "idle", "macd_short": "idle",
+    "bb_long":   "idle", "bb_short":   "idle",
+    "stoch_long":"idle", "stoch_short":"idle",
+}
+
 def load_state():
     data = db_get("bot_state")
     if data:
+        # 補上新欄位（舊版相容）
+        if "signal_states" not in data:
+            data["signal_states"] = DEFAULT_SIGNAL_STATES.copy()
         return data
     if os.path.exists("state.json"):
         with open("state.json") as f:
-            return json.load(f)
+            data = json.load(f)
+            if "signal_states" not in data:
+                data["signal_states"] = DEFAULT_SIGNAL_STATES.copy()
+            return data
     return {
-        "capital_long":    CONFIG["initial_capital_long"],
-        "capital_short":   CONFIG["initial_capital_short"],
-        "positions_long":  [],
-        "positions_short": [],
-        "total_trades": 0, "win_trades": 0, "total_pnl": 0.0,
-        "long_trades":  0, "long_wins":  0, "long_pnl":  0.0,
-        "short_trades": 0, "short_wins": 0, "short_pnl": 0.0,
+        "capital_long":   CONFIG["initial_capital_long"],
+        "capital_short":  CONFIG["initial_capital_short"],
+        "positions_long":  [], "positions_short": [],
+        "signal_states":  DEFAULT_SIGNAL_STATES.copy(),
+        "total_trades": 0, "win_trades": 0,  "total_pnl": 0.0,
+        "long_trades":  0, "long_wins":  0,  "long_pnl":  0.0,
+        "short_trades": 0, "short_wins": 0,  "short_pnl": 0.0,
     }
 
 def save_state(state):
@@ -368,43 +451,36 @@ def save_state(state):
 
 # ── 顯示狀態 ─────────────────────────────────────────────────────────────────
 
-def print_status(state, price, trend, longs, shorts):
+def print_status(state, price, trend, longs, shorts, sig_states):
     now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total = state["total_trades"]
     wr    = state["win_trades"] / total * 100 if total > 0 else 0
-    print(f"\n{'='*62}")
-    print(f"  ETH 多空模擬交易  |  {now}")
-    print(f"{'='*62}")
+
+    def ss(key): return "🟢" if sig_states.get(key) == "fired" else "⚪"
+
+    print(f"\n{'='*65}")
+    print(f"  ETH 多空模擬交易 v4  |  {now}")
+    print(f"{'='*65}")
     print(f"  價格 {price:,.0f} {CONFIG['quote_currency']}  |  "
           f"趨勢 {'🟢多頭' if trend=='bull' else '🔴空頭' if trend=='bear' else '⚪中性'}  |  "
           f"累計 {total}筆 勝率{wr:.1f}% 損益{state['total_pnl']:+.2f}")
+    print(f"  訊號狀態  多頭：MACD{ss('macd_long')} BB{ss('bb_long')} Stoch{ss('stoch_long')}  "
+          f"空頭：MACD{ss('macd_short')} BB{ss('bb_short')} Stoch{ss('stoch_short')}")
 
-    # 多單
-    print(f"\n  【做多】可用資金 {state['capital_long']:,.2f} USDT  "
-          f"持倉 {len(longs)}/{CONFIG['max_positions']}  "
-          f"累計損益 {state['long_pnl']:+.2f} USDT")
+    print(f"\n  【做多】資金 {state['capital_long']:,.2f}  持倉 {len(longs)}/{CONFIG['max_positions']}  損益 {state['long_pnl']:+.2f}")
     for i, pos in enumerate(longs, 1):
         pnl = pos.pnl_pct(price) * 100
-        print(f"    #{i} 進場 {pos.entry_price:,.0f}  "
-              f"資金 {pos.capital:,.0f}  "
-              f"損益 {pnl:+.2f}%  "
-              f"滾動{'✅' if pos.trailing_active else '⏳'}")
-    if not longs:
-        print(f"    空倉，等待多頭訊號")
+        print(f"    #{i} 進場 {pos.entry_price:,.0f}  資金 {pos.capital:,.0f}  "
+              f"損益 {pnl:+.2f}%  滾動{'✅' if pos.trailing_active else '⏳'}")
+    if not longs: print(f"    空倉，等待多頭訊號")
 
-    # 空單
-    print(f"\n  【做空】可用資金 {state['capital_short']:,.2f} USDT  "
-          f"持倉 {len(shorts)}/{CONFIG['max_positions']}  "
-          f"累計損益 {state['short_pnl']:+.2f} USDT")
+    print(f"\n  【做空】資金 {state['capital_short']:,.2f}  持倉 {len(shorts)}/{CONFIG['max_positions']}  損益 {state['short_pnl']:+.2f}")
     for i, pos in enumerate(shorts, 1):
         pnl = pos.pnl_pct(price) * 100
-        print(f"    #{i} 進場 {pos.entry_price:,.0f}  "
-              f"資金 {pos.capital:,.0f}  "
-              f"損益 {pnl:+.2f}%  "
-              f"滾動{'✅' if pos.trailing_active else '⏳'}")
-    if not shorts:
-        print(f"    空倉，等待空頭訊號")
-    print(f"{'='*62}")
+        print(f"    #{i} 進場 {pos.entry_price:,.0f}  資金 {pos.capital:,.0f}  "
+              f"損益 {pnl:+.2f}%  滾動{'✅' if pos.trailing_active else '⏳'}")
+    if not shorts: print(f"    空倉，等待空頭訊號")
+    print(f"{'='*65}")
 
 # ── 出場處理 ─────────────────────────────────────────────────────────────────
 
@@ -418,10 +494,10 @@ def process_exit(state, pos, price, reason):
     state["total_trades"]  += 1
     state["total_pnl"]     += pnl_usdt
     if pnl > 0:
-        state["win_trades"]    += 1
-        state[f"{sk}_wins"]    += 1
-    label = "多單" if sk == "long" else "空單"
+        state["win_trades"]  += 1
+        state[f"{sk}_wins"]  += 1
     icon  = "📤" if sk == "long" else "📥"
+    label = "多單" if sk == "long" else "空單"
     print(f"\n  {icon} {label}出場 #{pos.pos_id[-6:]}  {reason}")
     print(f"     {pos.entry_price:,.0f}→{price:,.0f}  {pnl*100:+.2f}% ({pnl_usdt:+.2f} USDT)")
     db_log_trade(sk, "EXIT", price, pnl, reason, {}, pos.pos_id)
@@ -429,22 +505,21 @@ def process_exit(state, pos, price, reason):
 # ── 主循環 ───────────────────────────────────────────────────────────────────
 
 def run():
-    print("🚀 ETH 多空雙向模擬交易機器人 v3 啟動")
-    print(f"   每次進場資金：該方向可用資金的 {CONFIG['trade_ratio']*100:.0f}%  |  "
-          f"同方向最多 {CONFIG['max_positions']} 筆")
+    print("🚀 ETH 多空雙向模擬交易機器人 v4 啟動")
+    print(f"   進場：單次趨勢只進一次，訊號反轉後重置")
+    print(f"   成交量確認：需大於 {CONFIG['vol_ma_period']} 根均量 × {CONFIG['vol_multiplier']}")
     init_db()
 
     state  = load_state()
 
-    # 相容舊版（單一持倉 → 陣列）
+    # 舊版相容
     if "position_long" in state and "positions_long" not in state:
-        old_l = state.pop("position_long", None)
-        old_s = state.pop("position_short", None)
-        state["positions_long"]  = [old_l] if old_l else []
-        state["positions_short"] = [old_s] if old_s else []
+        state["positions_long"]  = [state.pop("position_long")]  if state.get("position_long")  else []
+        state["positions_short"] = [state.pop("position_short")] if state.get("position_short") else []
 
-    longs  = [Position.from_dict(d) for d in state.get("positions_long",  [])]
-    shorts = [Position.from_dict(d) for d in state.get("positions_short", [])]
+    longs      = [Position.from_dict(d) for d in state.get("positions_long",  [])]
+    shorts     = [Position.from_dict(d) for d in state.get("positions_short", [])]
+    sig_states = state.get("signal_states", DEFAULT_SIGNAL_STATES.copy())
 
     while True:
         try:
@@ -460,7 +535,16 @@ def run():
             price  = float(df_30m["close"].iloc[-1])
             df_30m = add_indicators(df_30m)
             trend  = check_trend(df_4h, df_1d)
-            print_status(state, price, trend, longs, shorts)
+
+            # 更新訊號狀態機
+            sig_states, fire_long, fire_short = update_signal_states(df_30m, sig_states)
+            state["signal_states"] = sig_states
+
+            print_status(state, price, trend, longs, shorts, sig_states)
+
+            vol_ok = volume_confirmed(df_30m)
+            if not vol_ok:
+                print(f"  ⚠ 成交量不足（{df_30m['volume'].iloc[-1]:,.0f} < 均量{df_30m['vol_ma'].iloc[-1]:,.0f} × {CONFIG['vol_multiplier']}），本根不進場")
 
             # ── 多單管理 ──────────────────────────────────────────────────────
             weak_long = check_long_exit(df_30m)
@@ -470,36 +554,37 @@ def run():
                 reason = None
                 if pos.should_stop_loss(price):
                     reason = "停損"
-                else:
-                    if pos.trailing_active and weak_long["any"]:
-                        names  = [k for k, v in weak_long.items() if v and k != "any"]
-                        reason = f"指標轉弱（{'、'.join(names)}）"
-                    elif pos.check_trailing(price):
-                        reason = "滾動停利觸發"
+                elif pos.trailing_active and weak_long["any"]:
+                    names  = [k for k, v in weak_long.items() if v and k != "any"]
+                    reason = f"指標轉弱（{'、'.join(names)}）"
+                elif pos.check_trailing(price):
+                    reason = "滾動停利觸發"
                 if reason:
                     process_exit(state, pos, price, reason)
                     exited.append(pos)
             longs = [p for p in longs if p not in exited]
 
-            if len(longs) < CONFIG["max_positions"] and trend in ("bull", "neutral"):
-                sig = check_long_signals(df_30m)
-                triggered = [k for k, v in sig.items() if v is True]
-                print(f"  多頭訊號：{', '.join(triggered) if triggered else '無'} ({sig['count']}/3)")
-                if sig["entry"]:
+            # 多頭進場：有新訊號 + 成交量確認 + 趨勢允許 + 未滿倉
+            if fire_long and len(fire_long) >= 1 and vol_ok and \
+               len(longs) < CONFIG["max_positions"] and trend in ("bull", "neutral"):
+                # 需要至少兩個訊號（含已 fired 的舊訊號）
+                total_long_fired = sum(1 for k in ["macd_long","bb_long","stoch_long"]
+                                       if sig_states.get(k) == "fired")
+                if total_long_fired >= 2:
                     cap = state["capital_long"] * CONFIG["trade_ratio"]
                     if cap > 0:
-                        pos = Position("long", price, cap, datetime.now(), sig)
+                        triggered = list(fire_long.keys())
+                        pos = Position("long", price, cap, datetime.now(), fire_long)
                         longs.append(pos)
                         state["capital_long"] -= cap
                         db_log_trade("long", "ENTRY", price, 0,
-                                     f"訊號：{', '.join(triggered)}", sig, pos.pos_id)
-                        print(f"\n  📈 多單進場 #{pos.pos_id[-6:]}  "
-                              f"資金 {cap:,.0f}  訊號：{', '.join(triggered)}")
-            else:
-                if trend == "bear":
-                    print(f"  空頭趨勢，多單暫停")
-                elif len(longs) >= CONFIG["max_positions"]:
-                    print(f"  多單已滿 {CONFIG['max_positions']} 筆，等待出場")
+                                     f"新訊號：{', '.join(triggered)}", fire_long, pos.pos_id)
+                        print(f"\n  📈 多單進場 #{pos.pos_id[-6:]}  資金 {cap:,.0f}  "
+                              f"新訊號：{', '.join(triggered)}  已觸發 {total_long_fired}/3")
+                else:
+                    print(f"  多頭新訊號 {list(fire_long.keys())}，但累計觸發 {total_long_fired}/3，等待更多確認")
+            elif trend == "bear":
+                print(f"  空頭趨勢，多單暫停")
 
             # ── 空單管理 ──────────────────────────────────────────────────────
             weak_short = check_short_exit(df_30m)
@@ -509,36 +594,36 @@ def run():
                 reason = None
                 if pos.should_stop_loss(price):
                     reason = "停損"
-                else:
-                    if pos.trailing_active and weak_short["any"]:
-                        names  = [k for k, v in weak_short.items() if v and k != "any"]
-                        reason = f"指標轉強（{'、'.join(names)}）"
-                    elif pos.check_trailing(price):
-                        reason = "滾動停利觸發"
+                elif pos.trailing_active and weak_short["any"]:
+                    names  = [k for k, v in weak_short.items() if v and k != "any"]
+                    reason = f"指標轉強（{'、'.join(names)}）"
+                elif pos.check_trailing(price):
+                    reason = "滾動停利觸發"
                 if reason:
                     process_exit(state, pos, price, reason)
                     exited.append(pos)
             shorts = [p for p in shorts if p not in exited]
 
-            if len(shorts) < CONFIG["max_positions"] and trend in ("bear", "neutral"):
-                sig = check_short_signals(df_30m)
-                triggered = [k for k, v in sig.items() if v is True]
-                print(f"  空頭訊號：{', '.join(triggered) if triggered else '無'} ({sig['count']}/3)")
-                if sig["entry"]:
+            # 空頭進場：有新訊號 + 成交量確認 + 趨勢允許 + 未滿倉
+            if fire_short and len(fire_short) >= 1 and vol_ok and \
+               len(shorts) < CONFIG["max_positions"] and trend in ("bear", "neutral"):
+                total_short_fired = sum(1 for k in ["macd_short","bb_short","stoch_short"]
+                                        if sig_states.get(k) == "fired")
+                if total_short_fired >= 2:
                     cap = state["capital_short"] * CONFIG["trade_ratio"]
                     if cap > 0:
-                        pos = Position("short", price, cap, datetime.now(), sig)
+                        triggered = list(fire_short.keys())
+                        pos = Position("short", price, cap, datetime.now(), fire_short)
                         shorts.append(pos)
                         state["capital_short"] -= cap
                         db_log_trade("short", "ENTRY", price, 0,
-                                     f"訊號：{', '.join(triggered)}", sig, pos.pos_id)
-                        print(f"\n  📉 空單進場 #{pos.pos_id[-6:]}  "
-                              f"資金 {cap:,.0f}  訊號：{', '.join(triggered)}")
-            else:
-                if trend == "bull":
-                    print(f"  多頭趨勢，空單暫停")
-                elif len(shorts) >= CONFIG["max_positions"]:
-                    print(f"  空單已滿 {CONFIG['max_positions']} 筆，等待出場")
+                                     f"新訊號：{', '.join(triggered)}", fire_short, pos.pos_id)
+                        print(f"\n  📉 空單進場 #{pos.pos_id[-6:]}  資金 {cap:,.0f}  "
+                              f"新訊號：{', '.join(triggered)}  已觸發 {total_short_fired}/3")
+                else:
+                    print(f"  空頭新訊號 {list(fire_short.keys())}，但累計觸發 {total_short_fired}/3，等待更多確認")
+            elif trend == "bull":
+                print(f"  多頭趨勢，空單暫停")
 
             state["positions_long"]  = [p.to_dict() for p in longs]
             state["positions_short"] = [p.to_dict() for p in shorts]
